@@ -1,10 +1,11 @@
 import * as fs from "fs";
 import path from "path";
+import c from "chalk";
 import { execa } from "execa";
 import { readConfig } from "../config";
 import { experimental_patchConfig as patchConfig } from "../config/patch-config";
 import { createCommand } from "../core/create-command";
-import { confirm } from "../dialogs";
+import { confirm, select } from "../dialogs";
 import { UserError } from "../errors";
 import { logger } from "../logger";
 import { dedent } from "../utils/dedent";
@@ -36,6 +37,9 @@ export const declareCommand = createCommand({
 	},
 	async handler(args) {
 		const config = readConfig(args);
+		const existingDurableObjects = config.durable_objects.bindings.map(
+			(binding) => binding.name
+		);
 
 		const program = await createTypescript(config);
 		const checker = program.getTypeChecker();
@@ -53,11 +57,21 @@ export const declareCommand = createCommand({
 			bail("Default export was not found");
 		const defaultType = checker.getTypeOfSymbol(defaultExport);
 
-		const itemsExtendingDurableObject = defaultType.isUnion()
-			? defaultType.types.map((it) =>
-					checker.typeToString(it).replaceAll('"', "")
-				)
-			: undefined;
+		let itemsExtendingDurableObject = undefined;
+
+		if (defaultType.isUnion()) {
+			itemsExtendingDurableObject = defaultType.types.map((it) =>
+				checker.typeToString(it).replaceAll('"', "")
+			);
+		} else if (defaultType.isStringLiteral()) {
+			itemsExtendingDurableObject = [
+				checker.typeToString(defaultType).replaceAll('"', ""),
+			];
+		}
+
+		itemsExtendingDurableObject = itemsExtendingDurableObject?.filter(
+			(name) => !existingDurableObjects.includes(name)
+		);
 
 		if (!itemsExtendingDurableObject) {
 			throw new UserError("No Durable Objects found in your Worker");
@@ -67,8 +81,16 @@ export const declareCommand = createCommand({
 			`Found ${itemsExtendingDurableObject.length} Durable Objects that aren't present in your wrangler config`
 		);
 
+		for (const item of itemsExtendingDurableObject) {
+			logger.log(` - ${item}`);
+		}
+
+		logger.log("");
+
+		const namingStyle = await getNamingStyleFromOtherBindings(config);
+
 		const confirmed = await confirm(
-			`Are you sure you want to declare these Durable Objects? This will add them to your wrangler config and create a migration for them.`
+			`Are you sure you want to declare ${itemsExtendingDurableObject.length} Durable Objects in your config and add a migration for them?`
 		);
 
 		if (!confirmed) {
@@ -78,7 +100,7 @@ export const declareCommand = createCommand({
 		patchConfig(config.configPath ?? bail("No config path found"), {
 			durable_objects: {
 				bindings: itemsExtendingDurableObject.map((it) => ({
-					name: it,
+					name: styleNames(it, namingStyle),
 					class_name: it,
 				})),
 			},
@@ -89,8 +111,6 @@ export const declareCommand = createCommand({
 				},
 			],
 		});
-
-		logger.log(`Declared ${itemsExtendingDurableObject.join(", ")}`);
 	},
 });
 
@@ -135,10 +155,18 @@ function durableObjectResolverFile(
     type Worker = typeof worker;
 
     type IsDurableObject<T> = T extends { new (...args: any[]): DurableObject }
-      ? true
-      : T extends { new (...args: any[]): DurableObjectEntrypoint }
-      ? true
-      : false;
+			? true
+			: T extends { new (...args: any[]): DurableObjectEntrypoint }
+				? true
+				: IsPrototypeDurableObject<T>;
+
+		type IsPrototypeDurableObject<T> = T extends { prototype: infer Proto }
+			? Proto extends DurableObjectEntrypoint
+				? true
+				: Proto extends DurableObject
+					? true
+					: false
+			: false;
 
     type FindDos<T extends keyof Worker> = {
       [K in T]: IsDurableObject<Worker[K]> extends true ? K : never;
@@ -171,12 +199,21 @@ async function createTypescript(wranglerConfig: Config, script?: string) {
 
 	const resolverFile = durableObjectResolverFile(ts, main);
 
-	const host = ts.createCompilerHost(tsConfig.config);
+	const parsed = ts.parseJsonConfigFileContent(tsConfig.config, ts.sys, "./");
+	const host = ts.createCompilerHost(parsed.options);
+	const foo = ts.resolveModuleName(
+		"@cloudflare/workers-types",
+		main,
+		parsed.options,
+		host
+	);
 	const program = ts.createProgram({
 		rootNames: ["/wrangler/resolver.ts"],
 		options: {
-			...tsConfig.config,
-			types: ["@cloudflare/workers-types"],
+			...parsed.options,
+			types: foo.resolvedModule?.resolvedFileName
+				? [...(parsed.options.types ?? []), foo.resolvedModule.resolvedFileName]
+				: parsed.options.types,
 		},
 		host: {
 			...host,
@@ -201,4 +238,121 @@ async function createTypescript(wranglerConfig: Config, script?: string) {
 	});
 
 	return program;
+}
+
+const namingStyleDisplayNames = {
+	camel: "camelCase",
+	pascal: "PascalCase",
+	upper_snake: "UPPER_SNAKE_CASE",
+	lower_snake: "lower_snake_case",
+} as const;
+
+async function getNamingStyleFromOtherBindings(
+	config: Config
+): Promise<"camel" | "pascal" | "upper_snake" | "lower_snake"> {
+	const keys = [
+		"kv_namespaces",
+		"services",
+		"d1_databases",
+		"vectorize",
+	] as const;
+
+	for (const key of keys) {
+		const value = config[key];
+
+		if (!value) {
+			continue;
+		}
+
+		const maybeStyle = getNamingStyleFromNamedItems(value);
+		if (maybeStyle) {
+			logger.info(
+				`Detected bindings with ${c.dim(namingStyleDisplayNames[maybeStyle])} naming style, using that for Durable Objects`
+			);
+			return maybeStyle;
+		}
+	}
+
+	const style = await select(
+		"What naming style should be used for the Durable Objects?",
+		{
+			choices: [
+				{ title: "UPPER_SNAKE_CASE", value: "upper_snake" },
+				{ title: "camelCase", value: "camel" },
+				{ title: "lower_snake_case", value: "lower_snake" },
+				{ title: "PascalCase", value: "pascal" },
+			],
+		}
+	);
+
+	return style as "camel" | "pascal" | "upper_snake" | "lower_snake";
+}
+
+function getNamingStyleFromNamedItems(
+	items: { binding: string }[]
+): "camel" | "pascal" | "upper_snake" | "lower_snake" | undefined {
+	if (items.length === 0) {
+		return undefined;
+	}
+
+	// Check if all items match a specific naming convention
+	const allCamelCase = items.every((item) =>
+		/^[a-z][a-zA-Z0-9]*$/.test(item.binding)
+	);
+	if (allCamelCase) {
+		return "camel";
+	}
+
+	const allPascalCase = items.every((item) =>
+		/^[A-Z][a-zA-Z0-9]*$/.test(item.binding)
+	);
+	if (allPascalCase) {
+		return "pascal";
+	}
+
+	const allUpperSnakeCase = items.every((item) =>
+		/^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$/.test(item.binding)
+	);
+	if (allUpperSnakeCase) {
+		return "upper_snake";
+	}
+
+	const allLowerSnakeCase = items.every((item) =>
+		/^[a-z][a-z0-9]*(_[a-z0-9]+)*$/.test(item.binding)
+	);
+	if (allLowerSnakeCase) {
+		return "lower_snake";
+	}
+
+	return undefined;
+}
+
+function styleNames(
+	nameAsPascalCase: string,
+	style: "camel" | "pascal" | "upper_snake" | "lower_snake"
+): string {
+	// Already in PascalCase
+	if (style === "pascal") {
+		return nameAsPascalCase;
+	}
+
+	// Split the PascalCase name into parts
+	const parts = nameAsPascalCase
+		.replace(/([A-Z])/g, " $1")
+		.trim()
+		.split(" ");
+
+	if (style === "camel") {
+		// Convert to camelCase: first part lowercase, rest PascalCase
+		return parts[0].toLowerCase() + parts.slice(1).join("");
+	} else if (style === "upper_snake") {
+		// Convert to UPPER_SNAKE_CASE
+		return parts.map((part) => part.toUpperCase()).join("_");
+	} else if (style === "lower_snake") {
+		// Convert to lower_snake_case
+		return parts.map((part) => part.toLowerCase()).join("_");
+	}
+
+	// Default fallback (shouldn't happen due to type constraints)
+	return nameAsPascalCase;
 }
