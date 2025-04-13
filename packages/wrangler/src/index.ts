@@ -21,6 +21,7 @@ import { demandSingleValue } from "./core";
 import { CommandRegistry } from "./core/CommandRegistry";
 import { createRegisterYargsCommand } from "./core/register-yargs-command";
 import { d1 } from "./d1";
+import { declareCommand } from "./declare";
 import { deleteHandler, deleteOptions } from "./delete";
 import { deployCommand } from "./deploy";
 import { isAuthenticationError } from "./deploy/deploy";
@@ -1025,6 +1026,14 @@ export function createCLIParser(argv: string[]) {
 		},
 	]);
 	registry.registerNamespace("check");
+
+	registry.define([
+		{
+			command: "wrangler declare",
+			definition: declareCommand,
+		},
+	]);
+	registry.registerNamespace("declare");
 
 	wrangler.command("build", false, buildOptions, buildHandler);
 
